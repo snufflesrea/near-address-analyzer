@@ -1,276 +1,197 @@
-// Find NEAR documentation at https://docs.near.org
-use near_sdk::json_types::U64;
-use near_sdk::{AccountId, NearToken, PanicOnDefault, Promise, Timestamp, env, near, require};
+use near_sdk::json_types::U128;
+use near_sdk::store::{LookupMap, LookupSet};
+use near_sdk::{env, near, require, AccountId, BorshStorageKey, NearToken, PanicOnDefault};
 
-// Define the contract structure
-#[near(contract_state)]
-#[derive(PanicOnDefault)] // The contract is required to be initialized with `#[init]` functions
-pub struct Contract {
-    highest_bid: Bid,
-    auction_end_time: Timestamp,
-    auctioneer: AccountId,
-    is_claimed: bool,
+const NS_PER_SECOND: u64 = 1_000_000_000;
+const NS_PER_DAY: u64 = 86_400 * NS_PER_SECOND;
+const MAX_TXS_PER_REPORT: usize = 200;
+const MAX_FLAGGED_STORED: usize = 20;
+
+/// A transaction is suspicious if its value is strictly greater than this.
+fn threshold_yocto() -> u128 {
+    NearToken::from_near(1000).as_yoctonear()
 }
 
-// The Bid structure is used as function return value (JSON-serialized) and as part of the Contract
-// state (Borsh-serialized)
-#[near(serializers = [json, borsh])]
+fn to_near_string(yocto: u128) -> String {
+    let one = 10u128.pow(24);
+    format!("{}.{:02}", yocto / one, (yocto % one) / 10u128.pow(22))
+}
+
+#[near(serializers = [borsh])]
+#[derive(BorshStorageKey)]
+enum StorageKey {
+    Oracles,
+    Records,
+}
+
+/// Summary of one transfer, submitted by the oracle/indexer.
+#[near(serializers = [borsh, json])]
 #[derive(Clone)]
-pub struct Bid {
-    pub bidder: AccountId,
-    pub bid: NearToken,
+pub struct TxSummary {
+    pub tx_hash: String,
+    /// Value in yoctoNEAR
+    pub amount: U128,
 }
 
-// Implement the contract functions
+#[near(serializers = [borsh])]
+#[derive(Clone)]
+pub struct AddressRecord {
+    created_at_ns: u64,
+    suspicious_count: u32,
+    largest_yocto: u128,
+    flagged_hashes: Vec<String>,
+    updated_at_ns: u64,
+}
+
+/// What `analyze_address` returns.
+#[near(serializers = [json])]
+pub struct Analysis {
+    pub account_id: AccountId,
+    /// false = no report has been submitted for this address yet
+    pub analyzed: bool,
+    pub created_at_ns: Option<U128>,
+    pub age_seconds: Option<u64>,
+    pub age_days: Option<u64>,
+    pub has_suspicious_tx: Option<bool>,
+    pub suspicious_tx_count: Option<u32>,
+    pub largest_tx_near: Option<String>,
+    pub flagged_tx_hashes: Vec<String>,
+    pub last_updated_ns: Option<U128>,
+}
+
+#[near(contract_state)]
+#[derive(PanicOnDefault)]
+pub struct Contract {
+    owner: AccountId,
+    oracles: LookupSet<AccountId>,
+    records: LookupMap<AccountId, AddressRecord>,
+}
+
 #[near]
 impl Contract {
-    /// Initializer function that one must call after the contract code is deployed to an account
-    /// for the first time, all other functions will fail to execute until the contract state is
-    /// initialized (thanks to PanicOnDefault derive above).
-    /// It is common to batch contract initialization in the same transaction as contract deployment.
-    /// Sometimes #[private] attribute can also be useful to guard the function to be callable only
-    /// by the account where the contract is deployed to.
     #[init]
-    pub fn init(end_time: U64, auctioneer: AccountId) -> Self {
+    pub fn new(owner_id: AccountId) -> Self {
+        let mut oracles = LookupSet::new(StorageKey::Oracles);
+        oracles.insert(owner_id.clone());
         Self {
-            highest_bid: Bid {
-                bidder: env::current_account_id(),
-                bid: NearToken::from_yoctonear(1),
-            },
-            auction_end_time: end_time.into(),
-            is_claimed: false,
-            auctioneer,
+            owner: owner_id,
+            oracles,
+            records: LookupMap::new(StorageKey::Records),
         }
     }
 
-    /// Bid function can be called by any account on blockchain to make a higher bid on the auction
-    #[payable]
-    pub fn bid(&mut self) -> Promise {
-        // Assert the auction is still ongoing
+    // ---------- admin ----------
+
+    pub fn add_oracle(&mut self, oracle_id: AccountId) {
+        self.assert_owner();
+        self.oracles.insert(oracle_id);
+    }
+
+    pub fn remove_oracle(&mut self, oracle_id: AccountId) {
+        self.assert_owner();
+        self.oracles.remove(&oracle_id);
+    }
+
+    // ---------- oracle ----------
+
+    /// Called by a trusted indexer.
+    /// - `created_at_ns`: block timestamp (ns) of the account's first activity/creation.
+    ///   Only the first report sets it; later reports cannot change it.
+    /// - `transfers`: NEW transfers since the last report (the contract does not dedupe).
+    /// The contract itself decides which transfers are suspicious (> 1000 NEAR).
+    pub fn submit_report(
+        &mut self,
+        account_id: AccountId,
+        created_at_ns: U128,
+        transfers: Vec<TxSummary>,
+    ) {
         require!(
-            env::block_timestamp() < self.auction_end_time,
-            "Auction has ended"
+            self.oracles.contains(&env::predecessor_account_id()),
+            "Only an authorized oracle can submit reports"
+        );
+        require!(
+            transfers.len() <= MAX_TXS_PER_REPORT,
+            "Too many transfers in one report"
         );
 
-        // Current bid
-        let bid = env::attached_deposit();
-        let bidder = env::predecessor_account_id();
+        let now = env::block_timestamp();
+        let mut rec = self
+            .records
+            .get(&account_id)
+            .cloned()
+            .unwrap_or(AddressRecord {
+                created_at_ns: created_at_ns.0 as u64,
+                suspicious_count: 0,
+                largest_yocto: 0,
+                flagged_hashes: vec![],
+                updated_at_ns: now,
+            });
 
-        // Last bid recorded by the contract
-        let Bid {
-            bidder: last_bidder,
-            bid: last_bid,
-        } = self.highest_bid.clone();
-
-        // Check if the deposit is higher than the current bid
-        require!(bid > last_bid, "You must place a higher bid");
-
-        // Update the highest bid
-        self.highest_bid = Bid { bidder, bid };
-
-        // Transfer tokens back to the last bidder.
-        //
-        // NOTE: The result of this Promise is not handled. If this transfer fails (for example,
-        // because `last_bidder` account was removed), the previous bidder may not be refunded even
-        // though `self.highest_bid` has already been updated. For production use, consider
-        // implementing a withdrawal pattern or adding a callback to handle transfer failures.
-        Promise::new(last_bidder).transfer(last_bid)
+        for tx in transfers {
+            let amount = tx.amount.0;
+            if amount > rec.largest_yocto {
+                rec.largest_yocto = amount;
+            }
+            if amount > threshold_yocto() {
+                rec.suspicious_count = rec.suspicious_count.saturating_add(1);
+                if rec.flagged_hashes.len() < MAX_FLAGGED_STORED {
+                    rec.flagged_hashes.push(tx.tx_hash);
+                }
+            }
+        }
+        rec.updated_at_ns = now;
+        self.records.insert(account_id, rec);
     }
 
-    /// Claim function can be called by any account on blockchain to claim the auction and transfer
-    /// the tokens to the auctioneer
-    pub fn claim(&mut self) -> Promise {
-        // Assert the auction has ended
-        require!(
-            env::block_timestamp() > self.auction_end_time,
-            "Auction has not ended yet"
-        );
+    // ---------- views ----------
 
-        // Assert the auction has not been claimed yet
-        require!(!self.is_claimed, "Auction has already been claimed");
-        self.is_claimed = true;
-
-        // Transfer tokens to the auctioneer.
-        //
-        // NOTE: The result of this Promise is not handled. If this transfer fails (for example,
-        // because `last_bidder` account was removed), the previous bidder may not be refunded even
-        // though `self.highest_bid` has already been updated. For production use, consider
-        // implementing a withdrawal pattern or adding a callback to handle transfer failures.
-        Promise::new(self.auctioneer.clone()).transfer(self.highest_bid.bid)
+    /// Main entry point: returns address age and suspicious-transaction status.
+    pub fn analyze_address(&self, account_id: AccountId) -> Analysis {
+        match self.records.get(&account_id) {
+            None => Analysis {
+                account_id,
+                analyzed: false,
+                created_at_ns: None,
+                age_seconds: None,
+                age_days: None,
+                has_suspicious_tx: None,
+                suspicious_tx_count: None,
+                largest_tx_near: None,
+                flagged_tx_hashes: vec![],
+                last_updated_ns: None,
+            },
+            Some(r) => {
+                let age_ns = env::block_timestamp().saturating_sub(r.created_at_ns);
+                Analysis {
+                    account_id,
+                    analyzed: true,
+                    created_at_ns: Some(U128(r.created_at_ns as u128)),
+                    age_seconds: Some(age_ns / NS_PER_SECOND),
+                    age_days: Some(age_ns / NS_PER_DAY),
+                    has_suspicious_tx: Some(r.suspicious_count > 0),
+                    suspicious_tx_count: Some(r.suspicious_count),
+                    largest_tx_near: Some(to_near_string(r.largest_yocto)),
+                    flagged_tx_hashes: r.flagged_hashes.clone(),
+                    last_updated_ns: Some(U128(r.updated_at_ns as u128)),
+                }
+            }
+        }
     }
 
-    /*
-     * The functions below are read-only functions that can be called without a transaction (through
-     * JSON RPC query call). They read the data from the contract local storage and return the
-     * highest bid, auction end time, auctioneer, and claimed status
-     */
-
-    pub fn get_highest_bid(&self) -> Bid {
-        self.highest_bid.clone()
+    pub fn is_oracle(&self, account_id: AccountId) -> bool {
+        self.oracles.contains(&account_id)
     }
 
-    pub fn get_auction_end_time(&self) -> U64 {
-        self.auction_end_time.into()
-    }
-
-    pub fn get_auctioneer(&self) -> AccountId {
-        self.auctioneer.clone()
-    }
-
-    pub fn is_already_claimed(&self) -> bool {
-        self.is_claimed
+    pub fn get_owner(&self) -> AccountId {
+        self.owner.clone()
     }
 }
 
-/*
- * The rest of this file holds the inline tests for the code above
- * Learn more about Rust tests: https://doc.rust-lang.org/book/ch11-01-writing-tests.html
- */
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use near_sdk::json_types::U64;
-    use near_sdk::test_utils::{VMContextBuilder, accounts};
-    use near_sdk::{AccountId, testing_env};
-
-    fn get_context(predecessor_account_id: AccountId) -> VMContextBuilder {
-        let mut builder = VMContextBuilder::new();
-        builder
-            .current_account_id(accounts(0))
-            .signer_account_id(predecessor_account_id.clone())
-            .predecessor_account_id(predecessor_account_id);
-        builder
-    }
-
-    #[test]
-    fn init_contract() {
-        let end_time: U64 = U64::from(1000);
-        let alice: AccountId = "alice.near".parse().unwrap();
-        let contract = Contract::init(end_time, alice.clone());
-
-        let default_bid = contract.get_highest_bid();
-        assert_eq!(default_bid.bidder, env::current_account_id());
-        assert_eq!(default_bid.bid, NearToken::from_yoctonear(1));
-
-        let auction_end_time = contract.get_auction_end_time();
-        assert_eq!(auction_end_time, end_time);
-
-        let auctioneer = contract.get_auctioneer();
-        assert_eq!(auctioneer, alice);
-
-        assert!(!contract.is_already_claimed());
-    }
-
-    #[test]
-    fn bid_successfully() {
-        let auctioneer: AccountId = "auctioneer.near".parse().unwrap();
-        let alice: AccountId = "alice.near".parse().unwrap();
-        let end_time: U64 = U64::from(1000);
-        let mut contract = Contract::init(end_time, auctioneer.clone());
-
-        // Set block_timestamp before auction end time
-        let mut context = get_context(alice.clone());
-        context.block_timestamp(500);
-        context.attached_deposit(NearToken::from_near(2));
-        testing_env!(context.build());
-
-        // Bid should succeed
-        let _ = contract.bid();
-
-        // Verify highest bid is updated
-        let highest_bid = contract.get_highest_bid();
-        assert_eq!(highest_bid.bidder, alice);
-        assert_eq!(highest_bid.bid, NearToken::from_near(2));
-    }
-
-    #[test]
-    #[should_panic(expected = "Auction has ended")]
-    fn bid_after_auction_ended() {
-        let auctioneer: AccountId = "auctioneer.near".parse().unwrap();
-        let alice: AccountId = "alice.near".parse().unwrap();
-        let end_time: U64 = U64::from(1000);
-        let mut contract = Contract::init(end_time, auctioneer.clone());
-
-        // Set block_timestamp after auction end time
-        let mut context = get_context(alice.clone());
-        context.block_timestamp(2000);
-        context.attached_deposit(NearToken::from_near(2));
-        testing_env!(context.build());
-
-        // Bid should panic
-        let _ = contract.bid();
-    }
-
-    #[test]
-    #[should_panic(expected = "You must place a higher bid")]
-    fn bid_lower_than_current() {
-        let auctioneer: AccountId = "auctioneer.near".parse().unwrap();
-        let alice: AccountId = "alice.near".parse().unwrap();
-        let end_time: U64 = U64::from(1000);
-        let mut contract = Contract::init(end_time, auctioneer.clone());
-
-        // Set block_timestamp before auction end time
-        let mut context = get_context(alice.clone());
-        context.block_timestamp(500);
-        // Default bid is 1 yoctoNEAR, so bidding with 0 or less should fail
-        // But we'll bid with the same amount (1 yoctoNEAR) which should also fail
-        context.attached_deposit(NearToken::from_yoctonear(1));
-        testing_env!(context.build());
-
-        // Bid should panic
-        let _ = contract.bid();
-    }
-
-    #[test]
-    fn claim_after_auction_ended() {
-        let auctioneer: AccountId = "auctioneer.near".parse().unwrap();
-        let end_time: U64 = U64::from(1000);
-        let mut contract = Contract::init(end_time, auctioneer.clone());
-
-        // Set block_timestamp after auction end time
-        let mut context = get_context(auctioneer.clone());
-        context.block_timestamp(2000);
-        testing_env!(context.build());
-
-        // Claim should succeed
-        let _ = contract.claim();
-
-        // Verify auction is marked as claimed
-        assert!(contract.is_already_claimed());
-    }
-
-    #[test]
-    #[should_panic(expected = "Auction has not ended yet")]
-    fn claim_before_auction_ended() {
-        let auctioneer: AccountId = "auctioneer.near".parse().unwrap();
-        let end_time: U64 = U64::from(1000);
-        let mut contract = Contract::init(end_time, auctioneer.clone());
-
-        // Set block_timestamp before auction end time
-        let mut context = get_context(auctioneer.clone());
-        context.block_timestamp(500);
-        testing_env!(context.build());
-
-        // Claim should panic
-        let _ = contract.claim();
-    }
-
-    #[test]
-    #[should_panic(expected = "Auction has already been claimed")]
-    fn claim_twice() {
-        let auctioneer: AccountId = "auctioneer.near".parse().unwrap();
-        let end_time: U64 = U64::from(1000);
-        let mut contract = Contract::init(end_time, auctioneer.clone());
-
-        // Set block_timestamp after auction end time
-        let mut context = get_context(auctioneer.clone());
-        context.block_timestamp(2000);
-        testing_env!(context.build());
-
-        // First claim should succeed
-        let _ = contract.claim();
-
-        // Second claim should panic
-        let _ = contract.claim();
+impl Contract {
+    fn assert_owner(&self) {
+        require!(
+            env::predecessor_account_id() == self.owner,
+            "Only the owner can call this method"
+        );
     }
 }
