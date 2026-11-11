@@ -83,6 +83,7 @@
   [hidden] { display: none !important; }
   @media (max-width: 480px) { .row { flex-direction: column; } .row > div.narrow { flex: 1; } }
 </style>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@near-wallet-selector/modal-ui@8/styles.css">
 </head>
 <body>
 <div class="wrap">
@@ -111,10 +112,15 @@
   </div>
 
   <div id="error" class="error" hidden></div>
+  <div id="status" class="card" hidden></div>
   <div id="result" class="card" hidden></div>
 </div>
 
-<script>
+<script type="module">
+import { setupWalletSelector } from "https://esm.sh/@near-wallet-selector/core@8";
+import { setupModal } from "https://esm.sh/@near-wallet-selector/modal-ui@8";
+import { setupMyNearWallet } from "https://esm.sh/@near-wallet-selector/my-near-wallet@8";
+
 // ---- Configuration ------------------------------------------------------
 // Set your deployed contract here (it can also be typed in the form).
 const DEFAULT_CONTRACT = "";
@@ -272,12 +278,101 @@ function showError(msg) {
   $("result").hidden = true;
 }
 
+const statusBox = $("status");
+let timer = null;
+
+const fmtNear = (yocto) => String(Number(BigInt(yocto) / 10n ** 18n) / 1e6);
+
+function setStatus(text, label, onClick) {
+  const p = el("p", { class: "note", text });
+  p.style.margin = label ? "0 0 12px" : "0";
+  statusBox.replaceChildren(p);
+  if (label) {
+    const b = el("button", { text: label });
+    b.addEventListener("click", onClick);
+    statusBox.appendChild(b);
+  }
+  statusBox.hidden = false;
+}
+
+function stopPoll() { if (timer) { clearInterval(timer); timer = null; } }
+
+// Wallet connection (NEAR Wallet Selector). Rebuilt if network/contract change.
+let selectorP = null, selectorKey = "", modal = null;
+function getSelector(network, contract) {
+  const key = network + "|" + contract;
+  if (selectorKey !== key) {
+    selectorKey = key;
+    selectorP = setupWalletSelector({ network, modules: [setupMyNearWallet()] }).then((sel) => {
+      modal = setupModal(sel, { contractId: contract });
+      return sel;
+    });
+  }
+  return selectorP;
+}
+
+async function connectedWallet(network, contract) {
+  const selector = await getSelector(network, contract);
+  if (!selector.isSignedIn()) {
+    modal.show();
+    await new Promise((resolve) => {
+      const sub = selector.on("signedIn", () => { sub.remove(); resolve(); });
+    });
+  }
+  return selector.wallet();
+}
+
+// Poll analyze_address until the oracle's report lands.
+function poll(network, contract, account, prevUpdated) {
+  stopPoll();
+  const t0 = Date.now();
+  setStatus("Request sent. Waiting for the oracle (usually under a minute)…");
+  timer = setInterval(async () => {
+    try {
+      const a = await viewCall(network, contract, "analyze_address", { account_id: account });
+      if (a.analyzed && !a.pending_request && a.last_updated_ns !== prevUpdated) {
+        stopPoll();
+        try { localStorage.removeItem("nsa_watch"); } catch (e) {}
+        statusBox.hidden = true;
+        render(network, a);
+        return;
+      }
+    } catch (e) { /* transient RPC error; keep polling */ }
+    if (Date.now() - t0 > 10 * 60 * 1000) {
+      stopPoll();
+      setStatus("Still waiting after 10 minutes. The oracle may be offline. If no report arrives within 1 hour, you can cancel the request (cancel_request) and get your fee back.");
+    }
+  }, 5000);
+}
+
+async function request(network, contract, account, prev) {
+  try {
+    const fee = await viewCall(network, contract, "get_request_fee", {});
+    const wallet = await connectedWallet(network, contract);
+    try { localStorage.setItem("nsa_watch", JSON.stringify({ network, contract, account, prev })); } catch (e) {}
+    setStatus("Approve the transaction in your wallet…");
+    await wallet.signAndSendTransaction({
+      receiverId: contract,
+      actions: [{
+        type: "FunctionCall",
+        params: { methodName: "request_analysis", args: { account_id: account }, gas: "30000000000000", deposit: fee },
+      }],
+    });
+    poll(network, contract, account, prev); // redirect wallets reload the page; resume below
+  } catch (err) {
+    setStatus("Request failed: " + (err.message || err), "Try again", () => request(network, contract, account, prev));
+  }
+}
+
 async function analyze() {
   const network = $("network").value;
   const contract = $("contract").value.trim();
   const account = $("account").value.trim().toLowerCase();
 
   $("error").hidden = true;
+  statusBox.hidden = true;
+  $("result").hidden = true;
+  stopPoll();
 
   if (!validAccount(contract)) return showError("Enter a valid contract account ID.");
   if (!validAccount(account)) return showError("Enter a valid address to analyze.");
@@ -291,8 +386,19 @@ async function analyze() {
   btn.disabled = true;
   btn.textContent = "Analyzing…";
   try {
-    const result = await viewCall(network, contract, "analyze_address", { account_id: account });
-    render(network, result);
+    const a = await viewCall(network, contract, "analyze_address", { account_id: account });
+    const fee = fmtNear(await viewCall(network, contract, "get_request_fee", {}));
+    if (a.analyzed) render(network, a);
+
+    if (a.pending_request) {
+      poll(network, contract, account, a.last_updated_ns ?? null);
+    } else if (a.analyzed) {
+      setStatus("Want fresh data? A new analysis costs " + fee + " NEAR, paid to the oracle.",
+        "Request fresh analysis", () => request(network, contract, account, a.last_updated_ns));
+    } else {
+      setStatus("No data for this address yet. Request an analysis for " + fee + " NEAR (paid to the oracle).",
+        "Connect wallet and request", () => request(network, contract, account, null));
+    }
   } catch (err) {
     showError("Lookup failed: " + (err.message || err));
   } finally {
@@ -303,6 +409,17 @@ async function analyze() {
 
 $("go").addEventListener("click", analyze);
 $("account").addEventListener("keydown", (e) => { if (e.key === "Enter") analyze(); });
+
+// Resume after a wallet redirect (the page reloads when a wallet signs a transaction).
+try {
+  const w = JSON.parse(localStorage.getItem("nsa_watch") || "null");
+  if (w) {
+    $("network").value = w.network;
+    $("contract").value = w.contract;
+    $("account").value = w.account;
+    poll(w.network, w.contract, w.account, w.prev);
+  }
+} catch (e) { /* ignore */ }
 </script>
 </body>
 </html>
