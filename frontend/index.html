@@ -1,0 +1,308 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NEAR Address Analyzer</title>
+<style>
+  :root {
+    --bg: #f6f7f9;
+    --surface: #ffffff;
+    --text: #14171a;
+    --muted: #5f6b76;
+    --border: #dfe3e8;
+    --accent: #1a6b4a;
+    --accent-text: #ffffff;
+    --ok-bg: #e3f4ea;   --ok-text: #14633d;
+    --bad-bg: #fde8e8;  --bad-text: #a11d1d;
+    --warn-bg: #fff3d6; --warn-text: #7a5300;
+    color-scheme: light;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #101316;
+      --surface: #181c20;
+      --text: #e8ebee;
+      --muted: #8f9ba6;
+      --border: #2a3036;
+      --accent: #3fb582;
+      --accent-text: #08130e;
+      --ok-bg: #123324;   --ok-text: #6fdba6;
+      --bad-bg: #3a1717;  --bad-text: #ff9a9a;
+      --warn-bg: #3a2e10; --warn-text: #f2c866;
+      color-scheme: dark;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 32px 16px;
+    background: var(--bg); color: var(--text);
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    line-height: 1.5;
+  }
+  .wrap { max-width: 640px; margin: 0 auto; }
+  h1 { font-size: 1.5rem; margin: 0 0 4px; }
+  .sub { color: var(--muted); margin: 0 0 24px; font-size: .95rem; }
+  .card {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 12px; padding: 20px; margin-bottom: 16px;
+  }
+  label { display: block; font-size: .8rem; color: var(--muted); margin: 0 0 4px; }
+  input, select {
+    width: 100%; padding: 10px 12px; font-size: 1rem;
+    background: var(--bg); color: var(--text);
+    border: 1px solid var(--border); border-radius: 8px;
+  }
+  input:focus, select:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
+  .row { display: flex; gap: 12px; margin-bottom: 14px; }
+  .row > div { flex: 1; min-width: 0; }
+  .row > div.narrow { flex: 0 0 130px; }
+  button {
+    width: 100%; padding: 12px; font-size: 1rem; font-weight: 600;
+    background: var(--accent); color: var(--accent-text);
+    border: 0; border-radius: 8px; cursor: pointer;
+  }
+  button:disabled { opacity: .6; cursor: wait; }
+  .badge {
+    display: inline-block; padding: 4px 12px; border-radius: 999px;
+    font-weight: 600; font-size: .9rem;
+  }
+  .badge.ok { background: var(--ok-bg); color: var(--ok-text); }
+  .badge.bad { background: var(--bad-bg); color: var(--bad-text); }
+  .badge.warn { background: var(--warn-bg); color: var(--warn-text); }
+  .acct { font-family: ui-monospace, Menlo, Consolas, monospace; word-break: break-all; margin: 0 0 12px; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 16px; }
+  .stat { background: var(--bg); border-radius: 8px; padding: 12px; }
+  .stat .k { font-size: .75rem; color: var(--muted); }
+  .stat .v { font-size: 1.1rem; font-weight: 600; word-break: break-word; }
+  .tx-list { margin: 16px 0 0; padding: 0; list-style: none; }
+  .tx-list li { padding: 8px 0; border-top: 1px solid var(--border); font-size: .85rem; word-break: break-all; }
+  .tx-list a { color: var(--accent); font-family: ui-monospace, Menlo, Consolas, monospace; }
+  .note { font-size: .8rem; color: var(--muted); margin-top: 14px; }
+  .error { color: var(--bad-text); background: var(--bad-bg); padding: 12px; border-radius: 8px; font-size: .9rem; }
+  [hidden] { display: none !important; }
+  @media (max-width: 480px) { .row { flex-direction: column; } .row > div.narrow { flex: 1; } }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>NEAR Address Analyzer</h1>
+  <p class="sub">Check an address's age and whether it has any transfer above 1000 NEAR.</p>
+
+  <div class="card">
+    <div class="row">
+      <div>
+        <label for="contract">Analyzer contract</label>
+        <input id="contract" type="text" placeholder="my-analyzer.testnet" autocomplete="off" spellcheck="false">
+      </div>
+      <div class="narrow">
+        <label for="network">Network</label>
+        <select id="network">
+          <option value="testnet">testnet</option>
+          <option value="mainnet">mainnet</option>
+        </select>
+      </div>
+    </div>
+    <div style="margin-bottom:14px">
+      <label for="account">Address to analyze</label>
+      <input id="account" type="text" placeholder="alice.near" autocomplete="off" spellcheck="false">
+    </div>
+    <button id="go">Analyze</button>
+  </div>
+
+  <div id="error" class="error" hidden></div>
+  <div id="result" class="card" hidden></div>
+</div>
+
+<script>
+// ---- Configuration ------------------------------------------------------
+// Set your deployed contract here (it can also be typed in the form).
+const DEFAULT_CONTRACT = "";
+
+// RPC endpoints are tried in order. Edit if you use another provider.
+const RPC = {
+  testnet: ["https://rpc.testnet.fastnear.com", "https://rpc.testnet.near.org"],
+  mainnet: ["https://rpc.mainnet.fastnear.com", "https://rpc.mainnet.near.org"],
+};
+const EXPLORER = {
+  testnet: "https://testnet.nearblocks.io",
+  mainnet: "https://nearblocks.io",
+};
+// -------------------------------------------------------------------------
+
+const $ = (id) => document.getElementById(id);
+const ACCOUNT_RE = /^(([a-z\d]+[-_])*[a-z\d]+\.)*([a-z\d]+[-_])*[a-z\d]+$/;
+
+function validAccount(id) {
+  return id.length >= 2 && id.length <= 64 && ACCOUNT_RE.test(id);
+}
+
+// Remember the last-used values (optional convenience; may be unavailable)
+try {
+  $("contract").value = localStorage.getItem("nsa_contract") || DEFAULT_CONTRACT;
+  $("network").value = localStorage.getItem("nsa_network") || "testnet";
+} catch (e) {
+  $("contract").value = DEFAULT_CONTRACT;
+}
+
+async function viewCall(network, contractId, method, args) {
+  const body = {
+    jsonrpc: "2.0",
+    id: "analyzer",
+    method: "query",
+    params: {
+      request_type: "call_function",
+      finality: "final",
+      account_id: contractId,
+      method_name: method,
+      args_base64: btoa(JSON.stringify(args)),
+    },
+  };
+
+  let lastErr;
+  for (const url of RPC[network]) {
+    try {
+      const res = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      const data = await res.json();
+      if (data.error) {
+        const msg = data.error.data || data.error.message || "RPC error";
+        throw new Error(typeof msg === "string" ? msg : JSON.stringify(msg));
+      }
+      if (data.result && data.result.error) throw new Error(data.result.error);
+      const bytes = Uint8Array.from(data.result.result);
+      return JSON.parse(new TextDecoder().decode(bytes));
+    } catch (err) {
+      lastErr = err;
+    }
+  }
+  throw lastErr || new Error("All RPC endpoints failed");
+}
+
+function formatAge(days) {
+  const y = Math.floor(days / 365);
+  const m = Math.floor((days % 365) / 30);
+  const d = days - y * 365 - m * 30;
+  const parts = [];
+  if (y) parts.push(y + (y === 1 ? " year" : " years"));
+  if (m) parts.push(m + (m === 1 ? " month" : " months"));
+  if (d || !parts.length) parts.push(d + (d === 1 ? " day" : " days"));
+  return parts.join(", ");
+}
+
+function el(tag, props = {}, children = []) {
+  const node = document.createElement(tag);
+  for (const [k, v] of Object.entries(props)) {
+    if (k === "class") node.className = v;
+    else if (k === "text") node.textContent = v;
+    else node.setAttribute(k, v);
+  }
+  children.forEach((c) => node.appendChild(c));
+  return node;
+}
+
+function stat(label, value) {
+  return el("div", { class: "stat" }, [
+    el("div", { class: "k", text: label }),
+    el("div", { class: "v", text: value }),
+  ]);
+}
+
+function render(network, a) {
+  const box = $("result");
+  box.replaceChildren();
+
+  box.appendChild(el("p", { class: "acct", text: a.account_id }));
+
+  if (!a.analyzed) {
+    box.appendChild(el("span", { class: "badge warn", text: "Not analyzed yet" }));
+    box.appendChild(el("p", {
+      class: "note",
+      text: "No report has been submitted for this address. The oracle needs to index it first.",
+    }));
+    box.hidden = false;
+    return;
+  }
+
+  const suspicious = a.has_suspicious_tx;
+  box.appendChild(el("span", {
+    class: "badge " + (suspicious ? "bad" : "ok"),
+    text: suspicious ? "Suspicious activity found" : "No suspicious transactions",
+  }));
+
+  const created = new Date(Number(BigInt(a.created_at_ns) / 1000000n));
+  const updated = new Date(Number(BigInt(a.last_updated_ns) / 1000000n));
+
+  box.appendChild(el("div", { class: "grid" }, [
+    stat("Address age", formatAge(a.age_days)),
+    stat("Created", created.toLocaleDateString()),
+    stat("Transfers > 1000 NEAR", String(a.suspicious_tx_count)),
+    stat("Largest transfer", a.largest_tx_near + " NEAR"),
+  ]));
+
+  if (a.flagged_tx_hashes.length) {
+    box.appendChild(el("p", { class: "note", text: "Flagged transactions:" }));
+    const ul = el("ul", { class: "tx-list" });
+    a.flagged_tx_hashes.forEach((h) => {
+      const link = el("a", {
+        href: EXPLORER[network] + "/txns/" + encodeURIComponent(h),
+        target: "_blank",
+        rel: "noopener noreferrer",
+        text: h,
+      });
+      ul.appendChild(el("li", {}, [link]));
+    });
+    box.appendChild(ul);
+  }
+
+  box.appendChild(el("p", {
+    class: "note",
+    text: "Data last updated " + updated.toLocaleString() + ". Only the first 20 flagged transactions are stored.",
+  }));
+  box.hidden = false;
+}
+
+function showError(msg) {
+  const e = $("error");
+  e.textContent = msg;
+  e.hidden = false;
+  $("result").hidden = true;
+}
+
+async function analyze() {
+  const network = $("network").value;
+  const contract = $("contract").value.trim();
+  const account = $("account").value.trim().toLowerCase();
+
+  $("error").hidden = true;
+
+  if (!validAccount(contract)) return showError("Enter a valid contract account ID.");
+  if (!validAccount(account)) return showError("Enter a valid address to analyze.");
+
+  try {
+    localStorage.setItem("nsa_contract", contract);
+    localStorage.setItem("nsa_network", network);
+  } catch (e) { /* storage unavailable; ignore */ }
+
+  const btn = $("go");
+  btn.disabled = true;
+  btn.textContent = "Analyzing…";
+  try {
+    const result = await viewCall(network, contract, "analyze_address", { account_id: account });
+    render(network, result);
+  } catch (err) {
+    showError("Lookup failed: " + (err.message || err));
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "Analyze";
+  }
+}
+
+$("go").addEventListener("click", analyze);
+$("account").addEventListener("keydown", (e) => { if (e.key === "Enter") analyze(); });
+</script>
+</body>
+</html>

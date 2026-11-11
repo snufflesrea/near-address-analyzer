@@ -5,6 +5,12 @@ A NEAR smart contract (Rust, `near-sdk` 5.x) that analyzes an input account addr
 - **Address age**: how long ago the account was created / first active
 - **Suspicious transaction flag**: whether the address has any transfer worth **more than 1000 NEAR**
 
+## Demo
+
+See the NEAR Address Analyzer frontend in action:
+
+<video src="assets/demo.mp4" controls width="100%"></video>
+
 ## How it works
 
 A NEAR contract cannot read another account's history on-chain (it can't see when an account was created or what transactions it made). That data lives in the indexer layer. This project therefore uses an **oracle pattern**:
@@ -42,6 +48,8 @@ A NEAR contract cannot read another account's history on-chain (it can't see whe
 near-address-analyzer/
 ├── Cargo.toml
 ├── README.md
+├── frontend/
+│   └── index.html      # single-file web UI, no build step
 └── src/
     └── lib.rs
 ```
@@ -136,6 +144,20 @@ Example response:
 ```
 
 If no report has been submitted for the address, the response is `{"analyzed": false, ...}` with all other fields empty.
+
+## Frontend
+
+`frontend/index.html` is a single-file web UI with no build step. It calls the contract's `analyze_address` view method directly over NEAR JSON-RPC, so no wallet or login is needed.
+
+1. Open `frontend/index.html` and set `DEFAULT_CONTRACT` to your deployed contract (or type it into the form).
+2. Serve it locally:
+   ```bash
+   cd frontend
+   python3 -m http.server 8000
+   ```
+3. Open http://localhost:8000, pick the network, enter an address, and click **Analyze**.
+
+It shows the address age, a suspicious/clean badge, the transfer count, the largest transfer, and links to flagged transactions on NearBlocks. RPC endpoints are listed at the top of the script and tried in order, so you can swap in your own provider. It can be hosted on any static host (GitHub Pages, Netlify, Cloudflare Pages, and so on).
 
 ## API reference
 
