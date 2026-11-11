@@ -265,6 +265,20 @@ Wallet Selector and its modules load from esm.sh, so the page needs internet acc
 - **Scope of "suspicious".** The rule is a plain value threshold (> 1000 NEAR) and is not a fraud-detection model. It will flag legitimate large transfers too.
 - This code is unaudited. Review and test it before any production use.
 
+## Future Development
+
+Potential features to evolve NEAR Address Analyzer into a risk intelligence layer for autonomous agents and programmable payments:
+
+- **Agent Risk Assessment:** Expose account risk analysis through an API or agent-compatible tool so autonomous agents can evaluate recipients before making payments.
+- **Programmable Payment Guardrails:** Allow applications and agents to enforce payment limits, block high-risk recipients, or require human approval based on risk indicators.
+- **Multi-Oracle Verification:** Introduce multiple independent oracles and quorum-based reporting to improve data reliability.
+- **Behavioral Anomaly Detection:** Identify unusual transaction patterns, sudden increases in transfer volume, and suspicious account activity.
+- **Cross-Chain Risk Intelligence:** Explore integration with NEAR Intents to provide risk assessments for cross-chain payment workflows.
+
+**Long-term vision:** Become a reusable risk intelligence service that helps autonomous agents and applications make safer financial decisions before executing blockchain transactions.
+
+*These are proposed future enhancements and are not implemented in the current version.*
+
 ## Roadmap
 
 - Cancel button in the frontend for expired requests
