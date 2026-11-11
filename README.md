@@ -1,6 +1,6 @@
 # NEAR Address Analyzer
 
-A NEAR smart contract (Rust, `near-sdk` 5.x) that analyzes an input account address and returns:
+A NEAR smart contract (Rust, `near-sdk` 5.5) that analyzes an input account address and returns:
 
 - **Address age**: how long ago the account was created / first active
 - **Suspicious transaction flag**: whether the address has any transfer worth **more than 1000 NEAR**
